@@ -47,12 +47,13 @@ dualquant/
 ├── scales_smoothquant_rtn_int4/ # saved SmoothQuant scales (.pt)
 ├── vendor/                      # third-party code kept in-tree to stay self-contained
 │   └── dualscale_kernel_benchmark/  # fused_dual_scale_kernel used by the INT4 validators
-├── ablation/                    # ablation studies: init, scale comparison, SQNR, INT4 kernel
+├── ablation/                    # ablation studies: init, scale comparison, SQNR, INT4 kernel,
+│                                #   real packed NVFP4 W4A4 path (real_nvfp4_kernel/, Blackwell)
 └── README.md
 ```
 
 Not tracked (regenerable): `hessian_cache/`, `scale_cache/`,
-`ablation/real_int4_kernel/wrap_cache/`, and all measured outputs — the result
+`ablation/real_int4_kernel/wrap_cache/`, `ablation/real_nvfp4_kernel/wrap_cache/`, and all measured outputs — the result
 CSVs, plots and logs that `main.py`, `run_sweep.sh` and the `ablation/` scripts
 write. The code and the plotting scripts are included so every number in the
 paper can be regenerated; the recorded outputs themselves are not shipped.

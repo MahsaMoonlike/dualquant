@@ -57,6 +57,11 @@ pandas==3.0.5                                # result-table scripts only
 # at the commit in nunchaku_patches/submodule_pins.txt, build with
 # nunchaku_patches/new_files/setup_minimal.py, then point NUNCHAKU_DIR at the
 # resulting build/lib.* directory. Requires an Ada (sm_89) GPU, e.g. RTX 4090.
+#
+# The packed-NVFP4 path (ablation/real_nvfp4_kernel/) needs no build but a Blackwell GPU
+# (sm_100/sm_120, e.g. RTX 5090) and its own pinned environment (torch 2.14.1+cu130,
+# torchao 0.18, transformers 5.15): see ablation/real_nvfp4_kernel/requirements.txt.
+# It also provides the NVFP4 block-format backend: BLOCKFMT_BACKEND=nvfp4_numerics.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Audit notes

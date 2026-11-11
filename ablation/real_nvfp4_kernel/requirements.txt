@@ -1,0 +1,23 @@
+# Environment for the real packed NVFP4 W4A4 path (Blackwell: sm_100 / sm_120, e.g. RTX 5090).
+# Exact versions used for the reported numbers; see ENVIRONMENT.txt and REPRODUCE.md section 1.
+# Install torch FIRST from the CUDA index, then the rest with torch pinned as a constraint:
+#   uv pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
+#   echo "torch==2.14.1+cu130" > /tmp/c.txt
+#   uv pip install -c /tmp/c.txt --index-url https://download.pytorch.org/whl/cu130 \
+#       --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match \
+#       -r ablation/real_nvfp4_kernel/requirements.txt
+torch==2.14.1             # cu130 build; needs torch.nn.functional.scaled_mm + float4_e2m1fn_x2
+triton==3.8.0             # ships with the torch wheel
+torchao==0.18.0           # NVFP4 reference numerics (verification) -- cu130 build
+transformers==5.15.0      # the benchmark harness relies on 5.x StaticCache semantics
+tokenizers==0.22.2
+accelerate==1.14.0
+datasets==2.21.0
+huggingface-hub==1.33.0
+safetensors==0.8.0
+numpy==1.26.4             # legacy_vendor/ assumes NumPy 1.x
+pyarrow<19                # pyarrow >= 19 requires NumPy 2
+scipy
+tqdm
+sentencepiece
+protobuf

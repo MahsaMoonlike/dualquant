@@ -23,6 +23,9 @@ core.*
 hessian_cache/
 scale_cache/
 ablation/real_int4_kernel/wrap_cache/
+ablation/real_nvfp4_kernel/wrap_cache/
+# measured outputs are regenerated, not shipped (see README)
+ablation/real_nvfp4_kernel/logs/
 *.tar.gz
 
 # Re-include files that the extension rules above filter out but that this
