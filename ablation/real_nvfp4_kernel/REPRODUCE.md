@@ -72,7 +72,8 @@ E4M3 scale and its ±2 neighbours. Weight SQNR (vs original W) drops by ~0.4–0
 
 ```bash
 cd ablation/real_nvfp4_kernel
-./run_all.sh           # everything below, logs in logs/
+./run_all.sh           # everything below, logs in logs/<model>/
+DQ_MODEL=Qwen/Qwen3-14B DQ_LEAN_HEAD=1 ./run_all.sh   # another model (lean lm_head for PPL)
 ```
 
 or individually (benchmarks: run twice, report the warm second run):
@@ -102,7 +103,7 @@ python memory_breakdown.py --mode bf16|nvfp4        # Table 12 / Table 3 memory
 - Everything is torch-allocated, so (unlike nunchaku) `torch.cuda.memory_allocated()` sees
   the quantized weights; `mem_get_info` is still used for the resident totals.
 
-## 6. Results (RTX 5090, logs/ from `./run_all.sh`, warm second runs)
+## 6. Results — Llama-3.1-8B (RTX 5090, logs/Meta-Llama-3.1-8B/, warm second runs)
 
 WikiText-2 PPL (seqlen 8192): BF16 5.609 · fake RTN W4A4 9.026 (paper 9.04) ·
 fake DualQuant W4A4 6.693 (paper 6.83) · **real packed DualQuant W4A4 6.736**.
@@ -117,3 +118,25 @@ fake DualQuant W4A4 6.693 (paper 6.83) · **real packed DualQuant W4A4 6.736**.
 Decode b=1 is limited by cuBLASLt's FP4 kernel at M=1 (128x128 tiles, no split-K: ~0.7 TB/s
 effective vs ~1.6 TB/s for BF16 cuBLAS). A Triton small-M W4A4 kernel was tried and was 3x
 slower than cuBLAS, so it was dropped.
+
+## 7. Results — Qwen3-14B (RTX 5090, logs/Qwen3-14B/, warm second runs)
+
+`DQ_MODEL=Qwen/Qwen3-14B DQ_LEAN_HEAD=1 ./run_all.sh`. Prompt is 81 tokens (no BOS).
+
+| Workload | Mem BF16 | Mem W4A4 | Reduction | BF16 tok/s | W4A4 tok/s | Speedup |
+|---|---|---|---|---|---|---|
+| Prefill b=1  | 29.64 | 10.96 | 2.70× | 3067.4 | 5542.9  | 1.81× |
+| Prefill b=16 | 30.02 | 11.34 | 2.65× | 6790.3 | 20512.5 | 3.02× |
+| Decode b=1   | 29.65 | 10.97 | 2.70× | 47.5   | 66.0    | 1.39× |
+| Decode b=16  | 30.14 | 11.46 | 2.63× | 555.7  | 824.1   | 1.48× |
+
+WikiText-2 PPL (seqlen 8192): BF16 7.515 (paper 7.54) · fake RTN W4A4 7.906 (paper 7.93) ·
+DualQuant W4A4 fake 9.290 / real 9.260 · with `DQ_BETA_GAUGE=median` fake 8.145 / real 8.127
+(paper 7.75).
+
+**Known issue (Qwen3).** DualQuant's column scale reaches ~750x on Qwen3-14B, so x*col
+saturates single-level NVFP4's E4M3 block scale (448, i.e. block absmax 2688) in 60/280
+linears. `DQ_BETA_GAUGE=median` (dq_nvfp4_bcd.apply_gauge) divides col by a power of two and
+multiplies mat_q by it: exact (all FP4 codes and E4M3 scales unchanged, calibration-free) and
+recovers most of the loss, but the result is still above RTN and the paper. It is off by
+default, so the Llama numbers in section 6 are without it. Throughput and memory are unaffected.

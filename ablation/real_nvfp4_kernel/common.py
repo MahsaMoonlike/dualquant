@@ -46,14 +46,33 @@ def wikitext_test_ids(model_id, seqlen):
     return testenc.input_ids if hasattr(testenc, "input_ids") else testenc
 
 
+LEAN_HEAD = os.environ.get("DQ_LEAN_HEAD", "0") == "1"
+
+
 @torch.no_grad()
 def ppl(model, ids, seqlen, dev, chunk=256, log_every=20):
     """Non-overlapping windows, fp32 NLL accumulated in slices (same as
-    ../real_int4_kernel/ppl_eval.py, so numbers are comparable to the INT4 path)."""
+    ../real_int4_kernel/ppl_eval.py, so numbers are comparable to the INT4 path).
+
+    DQ_LEAN_HEAD=1 (for models that barely fit, e.g. Qwen3-14B BF16 on 32 GB): run the decoder
+    once, then apply lm_head per `chunk` rows instead of materializing the full
+    [seqlen, vocab] logits (2.5 GB for Qwen3 at 8192). Same math; only the lm_head GEMM's M
+    differs, so results can differ from the default path in the last bits."""
     n = ids.numel() // seqlen
     nll, tok = 0.0, 0
     for i in range(n):
         w = ids[:, i * seqlen:(i + 1) * seqlen].to(dev)
+        if LEAN_HEAD:
+            h = model.model(w, use_cache=False).last_hidden_state[0, :-1]
+            tgt = w[0, 1:]
+            for s in range(0, h.shape[0], chunk):
+                lg = model.lm_head(h[s:s + chunk]).float()
+                nll += F.cross_entropy(lg, tgt[s:s + chunk], reduction="sum").item()
+            tok += tgt.numel()
+            del h
+            if log_every and (i + 1) % log_every == 0:
+                print(f"    window {i+1}/{n}  running PPL={torch.tensor(nll/tok).exp():.4f}", flush=True)
+            continue
         logits = model(w, use_cache=False).logits
         src, tgt = logits[0, :-1], w[0, 1:]
         for s in range(0, src.shape[0], chunk):

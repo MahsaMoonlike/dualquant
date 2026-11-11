@@ -65,7 +65,7 @@ def fp4_code_to_f32(code: torch.Tensor) -> torch.Tensor:
     if _LUT is None or _LUT.device != code.device:
         lv = torch.tensor(FP4_LEVELS, dtype=torch.float32, device=code.device)
         _LUT = torch.cat([lv, -lv])
-    return _LUT[code.long()]
+    return _LUT[code.int()]
 
 
 def tensor_scale(amax: torch.Tensor) -> torch.Tensor:
@@ -115,7 +115,16 @@ def nvfp4_dequant_ref(codes, s8, global_scale):
     return (vals * sc.unsqueeze(-1)).reshape(shp)
 
 
-def nvfp4_fake_quant(x: torch.Tensor, batch_dims=0) -> torch.Tensor:
+def nvfp4_fake_quant(x: torch.Tensor, batch_dims=0, rows_per_chunk=1024) -> torch.Tensor:
+    if MODE == "single_level" and batch_dims == 0 and x.dim() >= 2 \
+            and x.numel() // x.shape[-1] > rows_per_chunk:
+        # single-level scales are row-local, so chunking rows is exact; bounds the fp32
+        # temporaries (a [8192, 17408] activation would otherwise need several GB)
+        x2 = x.reshape(-1, x.shape[-1])
+        out = torch.empty_like(x2)
+        for r in range(0, x2.shape[0], rows_per_chunk):
+            out[r:r + rows_per_chunk] = nvfp4_fake_quant(x2[r:r + rows_per_chunk])
+        return out.view(x.shape)
     codes, s8, g = nvfp4_quantize_ref(x, "auto", batch_dims=batch_dims)
     return nvfp4_dequant_ref(codes, s8, g).to(x.dtype)
 

@@ -75,6 +75,25 @@ def dualquant_nvfp4(weight: torch.Tensor, num_iter=15, device=None):
     return mat_q, col
 
 
+GAUGE = os.environ.get("DQ_BETA_GAUGE", "none")
+
+
+def apply_gauge(mat_q, col):
+    """DualQuant's (alpha, beta) has a free overall factor (paper, footnote 2): W is unchanged
+    by col -> col / c, mat_q -> mat_q * c. With c a power of two this is EXACT for NVFP4: every
+    FP4 code and E4M3 scale is unchanged, both on the weight side (packed with a power-of-two
+    tensor scale) and on the activation side -- except that activation block scales move by
+    1/c, i.e. out of E4M3's saturation at 448. Calibration-free: c depends on col only.
+      none   : keep the BCD's own normalisation (col ~ column l1 norm, up to ~750 on Qwen3)
+      median : c = 2^round(log2(median(col)))  -> typical channels are left unscaled"""
+    if GAUGE == "none":
+        return mat_q, col
+    assert GAUGE == "median", GAUGE
+    k = torch.round(torch.log2(col.float().median()))
+    c = torch.exp2(k).to(col.dtype)
+    return mat_q * c.to(mat_q.dtype), col / c
+
+
 def _cache_path(model_id, layer_key):
     safe = model_id.replace("/", "__")
     tag = f"{model_id}|{layer_key}|nvfp4|bs16|{N.MODE}|{BCD_DEVICE}"
@@ -94,5 +113,6 @@ def dualquant_nvfp4_cached(module, model_id, layer_key, num_iter=15):
         mat_q, col = dualquant_nvfp4(module.weight, num_iter=num_iter)
         mat_q, col = mat_q.cpu(), col.cpu()
         torch.save({"mat_q": mat_q, "beta": col}, path)
+    mat_q, col = apply_gauge(mat_q, col)
     module.weight.data.copy_(mat_q.to(module.weight.dtype).to(module.weight.device))
     return col.to(module.weight.device)
