@@ -59,14 +59,19 @@ already at ~20.5–21 dB and DualQuant does not improve weight MSE.
 | GEMM | `F.scaled_mm` → cuBLASLt block-scaled FP4 GEMM, FP32 accumulate, BF16 out; the weight's per-tensor scale is passed as a TensorWise scale (folded into alpha, no extra kernel). |
 | Rest | embedding, lm_head, RMSNorm, RoPE, attention, KV cache in BF16. |
 
-**Why real ≠ fake exactly (and why INT4 was closer).** DualQuant's NVFP4 weight block is
-`alpha_inv[r,b] · s8[r,b] · fp4`: two stacked E4M3 scales (the row scale and the inner
-block-format scale). The hardware has one E4M3 scale per block, and a product of two E4M3
-numbers is generally not E4M3, so packing `mat_q` is not lossless. (INT4's scales were BF16,
-8 mantissa bits, so its re-packing was essentially exact: 6.74 vs 6.73.) The packer keeps the
-loss small: a power-of-two per-tensor scale makes every block whose stacked scale *is*
-representable pack exactly (~65% of elements), and the rest pick the MSE-best of the absmax
-E4M3 scale and its ±2 neighbours. Weight SQNR (vs original W) drops by ~0.4–0.5 dB.
+**Packing DualQuant's weights.** DualQuant's NVFP4 weight block is `alpha_inv[r,b] · s8[r,b] · fp4`:
+two stacked E4M3 scales, while the hardware has one E4M3 scale per block (+ one FP32 per
+tensor). The packer (`quantize_weight`) makes this near-lossless: a power-of-two per-tensor
+scale, and per block the MSE-best of absmax/6, its ±2 E4M3 neighbours, and absmax/{4,3,2}
+(the latter catch blocks whose largest FP4 code is not 6, which are the majority of the
+non-exact ones). Result: 47.8–68.9 dB SQNR vs `mat_q`, 99.7–100% of elements exact, and real
+PPL within 0.01 of fake quant (6.685 vs 6.693).
+
+**SmoothQuant baseline (`--mode sq_nvfp4`).** The paper's SmoothQuant (alpha 0.5, the repo's
+calibrated `smoothquant/act_scales/`, upstream recipe: q/k/v and gate/up smoothed and folded
+into the RMSNorms, o/down unsmoothed), NVFP4 RTN weights, packed into the same
+`NVFP4W4A4Linear` with no runtime column scale (kernel variant without the multiply).
+Same formats, same GEMM: it isolates what DualQuant's per-layer beta costs at runtime.
 
 ## 4. Commands
 
@@ -105,19 +110,56 @@ python memory_breakdown.py --mode bf16|nvfp4        # Table 12 / Table 3 memory
 
 ## 6. Results — Llama-3.1-8B (RTX 5090, logs/Meta-Llama-3.1-8B/, warm second runs)
 
-WikiText-2 PPL (seqlen 8192): BF16 5.609 · fake RTN W4A4 9.026 (paper 9.04) ·
-fake DualQuant W4A4 6.693 (paper 6.83) · **real packed DualQuant W4A4 6.736**.
+Throughput for BF16, SmoothQuant and DualQuant from one session (logs/Meta-Llama-3.1-8B/graph_bench_*_run2.log);
+AWQ+ from a later session (logs/Meta-Llama-3.1-8B/cmp/); all speedups vs that BF16. SmoothQuant: alpha 0.5,
+repo's calibrated act scales, folded into RMSNorms (`sq_nvfp4`). AWQ+: repo's AWQ search
+(`awq_nvfp4.py`), deployed as packed Q(W s) with 1/s fused into the activation quantizer
+(`awq_nvfp4`), the same runtime mechanism as DualQuant's beta.
 
-| Workload | Mem BF16 | Mem W4A4 | Reduction | BF16 tok/s | W4A4 tok/s | Speedup |
-|---|---|---|---|---|---|---|
-| Prefill b=1  | 16.30 | 6.20 | 2.63× | 5702.1  | 9093.4  | 1.59× |
-| Prefill b=16 | 16.62 | 6.53 | 2.55× | 12790.6 | 35785.7 | 2.80× |
-| Decode b=1   | 16.30 | 6.21 | 2.63× | 84.3    | 103.6   | 1.23× |
-| Decode b=16  | 16.70 | 6.61 | 2.53× | 901.7   | 1262.5  | 1.40× |
+| | BF16 | SmoothQuant | AWQ+ | DualQuant |
+|---|---|---|---|---|
+| Calibration-free | – | no | no | yes |
+| WikiText-2 PPL, real packed (fake) | 5.609 | 7.281 (7.277) | 22.406 (22.493) | **6.685** (6.693) |
+| Paper Table 1 | 5.62 | 7.32 | 22.79 | 6.83 |
+| Prefill b=1 tok/s | 5704.9 | 9145.8 (1.60×) | 9102.0 (1.60×) | 9100.6 (1.60×) |
+| Prefill b=16 tok/s | 12822.1 | 36134.4 (2.82×) | 36352.1 (2.84×) | 36117.8 (2.82×) |
+| Decode b=1 tok/s | 84.4 | 104.4 (1.24×) | 103.6 (1.23×) | 103.5 (1.23×) |
+| Decode b=16 tok/s | 901.7 | 1268.9 (1.41×) | 1262.8 (1.40×) | 1262.7 (1.40×) |
+| Memory prefill b=1 / b=16 (GB) | 16.30 / 16.62 | 6.18 / 6.51 | 6.20 / 6.53 | 6.20 / 6.53 |
+| Memory decode b=1 / b=16 (GB) | 16.30 / 16.70 | 6.19 / 6.59 | 6.21 / 6.61 | 6.21 / 6.61 |
 
-Decode b=1 is limited by cuBLASLt's FP4 kernel at M=1 (128x128 tiles, no split-K: ~0.7 TB/s
-effective vs ~1.6 TB/s for BF16 cuBLAS). A Triton small-M W4A4 kernel was tried and was 3x
-slower than cuBLAS, so it was dropped.
+Activation quantization (ms, prefill b1 / b16 / decode b1 / b16): SmoothQuant 0.335 / 1.532 /
+0.222 / 0.233; AWQ+ 0.380 / 1.632 / 0.291 / 0.306; DualQuant 0.379 / 1.634 / 0.291 / 0.305.
+The fused per-channel multiply costs 0.04–0.10 ms per forward (<0.8% of GPU time).
+Run-to-run throughput noise is ~0.5%. AWQ+ "fake" is the deployable form (x/s quantized);
+the repo's methods/awq.py form (Q(W s)/s, x unscaled) gives 22.279.
+Decode b=1 is limited by cuBLASLt's FP4 kernel at M=1 (128x128 tiles, no split-K).
+
+### Offline cost: calibration (SmoothQuant, AWQ+) vs optimization (DualQuant)
+
+`python calib_cost.py --method sq|awq|dq` (logs/Meta-Llama-3.1-8B/calib/, run 2 of 2; run 1 within
+8%). Timed from the BF16 model in host memory (model load excluded for all), one decoder block
+(sq, awq) or one linear (dq) on the GPU at a time.
+- SmoothQuant: per-channel act absmax over 128 x 512 WikiText-2 train tokens (the repo's
+  calibration chunks), alpha swept per smoothing point over the SmoothQuant paper's sweet spot
+  {0.4, 0.5, 0.6} by NVFP4 W4A4 output error of the group's linears; chose 0.5 x35, 0.6 x28, 0.4 x1.
+- AWQ+: the repo's procedure (compute_awq_scale per linear, 20-point grid, no clipping search)
+  on the same 128 x 512 tokens.
+- DualQuant: BCD with T = 15 (paper, Algorithm 1); output bit-identical to the cached scales
+  the real path deploys (224/224 linears).
+
+| | SmoothQuant (alpha sweep) | AWQ+ | DualQuant |
+|---|---|---|---|
+| Calibration data | 128 x 512 tokens | 128 x 512 tokens | none |
+| Calibration data prep | 3.0 s | 3.0 s | – |
+| Forward passes (block-sequential) | 11.8 s | 12.3 s | – |
+| Search / optimization | 45.5 s (3 alphas x 64 points) | 359.9 s (20 grid x 224 linears) | 41.0 s (BCD, 224 linears) |
+| **Total** | **60.3 s** (1.47x DQ) | **375.2 s** (9.15x DQ) | **41.0 s** |
+| Peak GPU memory | 5.45 GB | 21.85 GB | 2.22 GB |
+| WikiText-2 PPL, real packed | 7.334 | 18.510 | **6.685** |
+
+PPL is for these 128-sample calibrations; with the repo's shipped SmoothQuant act scales
+(alpha 0.5) SmoothQuant gives 7.281 and AWQ+ with the repo's ~93 chunks 22.406 (table above).
 
 ## 7. Results — Qwen3-14B (RTX 5090, logs/Qwen3-14B/, warm second runs)
 
@@ -140,3 +182,46 @@ linears. `DQ_BETA_GAUGE=median` (dq_nvfp4_bcd.apply_gauge) divides col by a powe
 multiplies mat_q by it: exact (all FP4 codes and E4M3 scales unchanged, calibration-free) and
 recovers most of the loss, but the result is still above RTN and the paper. It is off by
 default, so the Llama numbers in section 6 are without it. Throughput and memory are unaffected.
+
+### Qwen3-14B: DualQuant vs SmoothQuant vs AWQ+ (logs/Qwen3-14B/cmp/, one session, run 2)
+
+Same configuration as section 6 (SmoothQuant alpha 0.5 with the repo's
+`Qwen3-14B_seq_len_8192_4bit.pt` act scales; AWQ+ calibrated by `awq_nvfp4.py`, 95 x 512 tokens).
+DualQuant real PPL re-measured with the current packer.
+
+| | BF16 | SmoothQuant | AWQ+ | DualQuant | DualQuant + gauge |
+|---|---|---|---|---|---|
+| Calibration-free | – | no | no | yes | yes |
+| WikiText-2 PPL, real packed (fake) | 7.515 | **7.717** (7.722) | 8.055 (8.061) | 9.313 (9.290) | 8.157 (8.145) |
+| Paper | 7.54 | – | – | 7.75 | 7.75 |
+| Prefill b=1 tok/s | 3074.1 | 5574.7 (1.81×) | 5550.8 (1.81×) | 5550.8 (1.81×) | same |
+| Prefill b=16 tok/s | 6871.4 | 20923.2 (3.04×) | 20963.9 (3.05×) | 21017.0 (3.06×) | same |
+| Decode b=1 tok/s | 47.5 | 66.5 (1.40×) | 66.1 (1.39×) | 66.2 (1.39×) | same |
+| Decode b=16 tok/s | 556.2 | 830.0 (1.49×) | 827.4 (1.49×) | 827.6 (1.49×) | same |
+| Memory prefill b=1 / b=16 (GB) | 29.64 / 30.02 | 10.94 / 11.32 | 10.96 / 11.34 | 10.96 / 11.34 | same |
+| Memory decode b=1 / b=16 (GB) | 29.65 / 30.14 | 10.95 / 11.44 | 10.97 / 11.46 | 10.97 / 11.46 | same |
+
+Activation quantization (ms, prefill b1 / b16 / decode b1 / b16): SmoothQuant 0.441 / 2.448 /
+0.276 / 0.289; AWQ+ 0.499 / 2.555 / 0.362 / 0.379; DualQuant 0.498 / 2.551 / 0.361 / 0.379.
+Fake RTN W4A4 is 7.906 (paper 7.93); AWQ in the methods/awq.py form (Q(W s)/s) is 7.976. On Qwen3-14B both calibrated baselines beat DualQuant:
+DualQuant's column scale (up to ~750) saturates single-level NVFP4 activations (see the known
+issue above), whereas SmoothQuant's folded scale shrinks the outlier channels before quantization.
+
+### Qwen3-14B offline cost: calibration (SmoothQuant, AWQ+) vs optimization (DualQuant)
+
+Same procedure and settings as for Llama-3.1-8B in section 6 (logs/Qwen3-14B/calib/, run 2 of 2;
+run 1 within 4%). SmoothQuant chose alpha 0.6 x68, 0.5 x12. DualQuant's BCD output is
+bit-identical to the deployed cache (280/280 linears).
+
+| | SmoothQuant (alpha sweep) | AWQ+ | DualQuant | DualQuant + gauge |
+|---|---|---|---|---|
+| Calibration data | 128 x 512 tokens | 128 x 512 tokens | none | none |
+| Calibration data prep | 2.9 s | 2.8 s | – | – |
+| Forward passes (block-sequential) | 25.0 s | 30.1 s | – | – |
+| Search / optimization | 92.6 s (3 alphas x 80 points) | 744.2 s (20 grid x 280 linears) | 84.9 s (BCD, 280 linears) | same |
+| **Total** | **120.5 s** (1.42x DQ) | **777.0 s** (9.15x DQ) | **84.9 s** | same |
+| Peak GPU memory | 7.64 GB | 27.40 GB | 3.37 GB | same |
+| WikiText-2 PPL, real packed | **7.804** | 8.087 | 9.313 | 8.157 |
+
+With the repo's shipped SmoothQuant act scales (alpha 0.5) SmoothQuant gives 7.717 and AWQ+
+with ~95 chunks 8.055 (table above). The gauge is a power-of-two rescale of beta (no extra cost).

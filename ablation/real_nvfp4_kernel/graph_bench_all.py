@@ -167,7 +167,7 @@ def decode(model, ids, bs, dev, new_tokens=100, val_steps=8):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=common.DEFAULT_MODEL)
-    ap.add_argument("--mode", choices=["bf16", "nvfp4"], required=True)
+    ap.add_argument("--mode", choices=["bf16", "nvfp4", "sq_nvfp4", "awq_nvfp4"], required=True)
     cli = ap.parse_args()
     dev = torch.device("cuda:0")
     model = build_model(cli.model, cli.mode, dev)

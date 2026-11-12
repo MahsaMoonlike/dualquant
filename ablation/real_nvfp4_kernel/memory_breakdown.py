@@ -38,7 +38,7 @@ def tensor_bytes(model):
         if isinstance(m, NVFP4W4A4Linear):
             c["lin_w"] += m.qweight.numel()
             c["lin_scale"] += m.wscale.numel()
-            c["lin_misc"] += m.wtscale.numel() * 4 + m.col.numel() * 4
+            c["lin_misc"] += m.wtscale.numel() * 4 + (0 if m.col is None else m.col.numel() * 4)
             q_ids.update(id(b) for b in m.buffers())
     for i, parent, attr, _ in common.iter_linears(model):
         lin = getattr(parent, attr)
@@ -65,7 +65,7 @@ def resident(total, base):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=common.DEFAULT_MODEL)
-    ap.add_argument("--mode", choices=["bf16", "nvfp4"], required=True)
+    ap.add_argument("--mode", choices=["bf16", "nvfp4", "sq_nvfp4", "awq_nvfp4"], required=True)
     cli = ap.parse_args()
     dev = torch.device("cuda:0")
     torch.cuda.init()
@@ -110,7 +110,7 @@ def main():
             rows.append((f"decode b={bs}", kv(bs), tr))
         scratch = max(scratch, resident(total, base) - weights)
 
-    q = cli.mode == "nvfp4"
+    q = cli.mode != "bf16"
     print(f"\n===== {cli.mode.upper()} memory breakdown (GB) — {cli.model} =====")
     print(f"  {'Quantized-linear weights' + (' (FP4 packed)' if q else ' (BF16)'):<44}{tb['lin_w']:8.3f}")
     if q:

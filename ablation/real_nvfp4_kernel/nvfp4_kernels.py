@@ -65,7 +65,7 @@ def dq_nvfp4_quantize_act_kernel(
         x_ptr, col_ptr, part_ptr, n_part, q_ptr, s_ptr, g_ptr,
         M, K, stride_xm, n_cb, inv6, inv2688,
         BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, NP: tl.constexpr,
-        TWO_LEVEL: tl.constexpr):
+        TWO_LEVEL: tl.constexpr, HAS_COL: tl.constexpr):
     pm = tl.program_id(0)
     pk = tl.program_id(1)
 
@@ -84,8 +84,9 @@ def dq_nvfp4_quantize_act_kernel(
     rk = pk * BLOCK_K + tl.arange(0, BLOCK_K)
     msk = (rm[:, None] < M) & (rk[None, :] < K)
     x = tl.load(x_ptr + rm[:, None] * stride_xm + rk[None, :], mask=msk, other=0.0).to(tl.float32)
-    c = tl.load(col_ptr + rk, mask=rk < K, other=0.0)
-    x = x * c[None, :]                                    # DualQuant beta, fused into the load
+    if HAS_COL:
+        c = tl.load(col_ptr + rk, mask=rk < K, other=0.0)
+        x = x * c[None, :]                                # DualQuant beta, fused into the load
 
     xb = tl.reshape(x, (BLOCK_M, BLOCK_K // 16, 16))
     bmax = tl.max(tl.abs(xb), axis=2)                     # [BM, BK/16]
@@ -144,7 +145,9 @@ def _unit_scale(dev):
 
 
 def quantize_act(x2d, col, two_level=None):
-    """x2d [M,K] bf16 contiguous, col [K] fp32 -> (packed [M,K/2] u8, swizzled scales u8, g [] fp32)."""
+    """x2d [M,K] bf16 contiguous, col [K] fp32 or None -> (packed [M,K/2] u8, swizzled scales u8,
+    g [] fp32). col=None (SmoothQuant: its scale is folded into the RMSNorm) compiles a kernel
+    variant without the per-channel multiply."""
     two_level = (N.MODE == "two_level") if two_level is None else two_level
     M, K = x2d.shape
     BM, BK = _tiles(M)
@@ -156,13 +159,15 @@ def quantize_act(x2d, col, two_level=None):
     n_part = grid[0] * grid[1]
     part = torch.empty(n_part, dtype=torch.float32, device=dev) if two_level else g
     if two_level:
+        assert col is not None, "two-level activations are only wired up with a column scale"
         _act_amax_kernel[grid](x2d, col, part, M, K, x2d.stride(0), BLOCK_M=BM, BLOCK_K=BK,
                                num_warps=4)
     dq_nvfp4_quantize_act_kernel[grid](
-        x2d, col, part, n_part, q, s, g, M, K, x2d.stride(0), triton.cdiv(K // 16, 4),
+        x2d, x2d if col is None else col, part, n_part, q, s, g, M, K, x2d.stride(0),
+        triton.cdiv(K // 16, 4),
         _INV6, _INV2688,
         BLOCK_M=BM, BLOCK_K=BK, NP=max(16, triton.next_power_of_2(n_part)),
-        TWO_LEVEL=two_level, num_warps=4)
+        TWO_LEVEL=two_level, HAS_COL=col is not None, num_warps=4)
     return q, s, g
 
 
@@ -176,19 +181,28 @@ def quantize_weight(w, search=2):
     general. Two things keep the loss small, both offline and free at runtime:
       * g_w is a power of two, so every block whose stacked scale IS representable (e.g.
         alpha_inv a power of two, which the E4M3-tiny clamp makes common) packs exactly;
-      * for the rest, each block's E4M3 scale is the MSE-best of the absmax choice and its
-        +-`search` E4M3 neighbours (ties keep the absmax choice).
+      * each block's E4M3 scale is the MSE-best of absmax/6, its +-`search` E4M3 neighbours,
+        and absmax/{4,3,2} (ties keep absmax/6). The latter make blocks whose largest code is
+        not 6 -- e.g. RTN blocks whose scale was clamped to E4M3 tiny -- pack exactly.
     The per-tensor scale is a per-layer constant folded into the GEMM alpha."""
     wf = w.to(torch.float32)
     R, C = wf.shape
     g = N.tensor_scale(wf.abs().amax())
     g = torch.exp2(torch.ceil(torch.log2(g)))           # power of two, block scales stay <= 448
     wb = wf.view(R, C // 16, 16)
-    s_abs = (wb.abs().amax(-1) / N.F4_MAX / g).clamp(N.E4M3_TINY, N.E4M3_MAX).to(torch.float8_e4m3fn)
-    bits = s_abs.view(torch.uint8).to(torch.int16)
+    bmax = wb.abs().amax(-1)
+
+    def e4m3_bits(v):
+        return v.clamp(N.E4M3_TINY, N.E4M3_MAX).to(torch.float8_e4m3fn).view(torch.uint8).to(torch.int16)
+
+    # candidate block scales: absmax/6 and its +-search E4M3 neighbours, plus absmax/{4,3,2}
+    # (exact for blocks whose largest FP4 code is 4/3/2, e.g. scales clamped at E4M3 tiny)
+    base = e4m3_bits(bmax / N.F4_MAX / g)
+    cands = [base] + [base + s * k for k in range(1, search + 1) for s in (-1, 1)] \
+        + [e4m3_bits(bmax / q / g) for q in (4.0, 3.0, 2.0)]
     best_err = best_s = best_c = None
-    for d in [0] + [s * k for k in range(1, search + 1) for s in (-1, 1)]:
-        cand = (bits + d).clamp(8, 126).to(torch.uint8).view(torch.float8_e4m3fn)  # normals only
+    for bits in cands:
+        cand = bits.clamp(8, 126).to(torch.uint8).view(torch.float8_e4m3fn)        # normals only
         cf = cand.to(torch.float32)
         v = (wb * ((1.0 / g) / cf).unsqueeze(-1)).clamp(-N.F4_MAX, N.F4_MAX)
         c = N.fp4_rne_code(v)
@@ -213,9 +227,10 @@ def nvfp4_gemm(qa, sa, ga, qw, sw, gw):
 
 
 class NVFP4W4A4Linear(nn.Module):
-    """Drop-in for a DualQuant-quantized nn.Linear (bias-free): y = Q(x*col) @ Q(mat_q)^T."""
+    """Drop-in for a quantized bias-free nn.Linear: y = Q(x*col) @ Q(mat_q)^T.
+    col=None for methods whose per-channel scale is folded offline (SmoothQuant)."""
 
-    def __init__(self, mat_q, col, device="cuda"):
+    def __init__(self, mat_q, col=None, device="cuda"):
         super().__init__()
         n, k = mat_q.shape
         assert k % 64 == 0 and n % 16 == 0, (n, k)
@@ -224,7 +239,8 @@ class NVFP4W4A4Linear(nn.Module):
         self.register_buffer("qweight", qw)        # [N, K/2] uint8 (FP4 x2)
         self.register_buffer("wscale", sw)         # [N*K/16] uint8 (E4M3, swizzled)
         self.register_buffer("wtscale", gw)        # [] fp32
-        self.register_buffer("col", col.to(device=device, dtype=torch.float32).contiguous())
+        self.register_buffer("col", None if col is None else
+                             col.to(device=device, dtype=torch.float32).contiguous())
 
     def forward(self, x):
         shp = x.shape

@@ -85,7 +85,7 @@ def split(d, lm):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=common.DEFAULT_MODEL)
-    ap.add_argument("--mode", choices=["bf16", "nvfp4"], required=True)
+    ap.add_argument("--mode", choices=["bf16", "nvfp4", "sq_nvfp4", "awq_nvfp4"], required=True)
     ap.add_argument("--show-kernels", action="store_true")
     cli = ap.parse_args()
     dev = torch.device("cuda:0")
@@ -119,7 +119,7 @@ def main():
             del g, st
             print(f"{'decode b'+str(bs):<14}" + "".join(f"{row[c]:>12.3f}" for c in CATS)
                   + f"{sum(row.values()):>10.3f}", flush=True)
-    if cli.mode == "nvfp4":
+    if cli.mode != "bf16":
         print("\nactivation quantization share of NVFP4 GPU time: " + ", ".join(
             f"{k} {100*v['act_quant']/sum(v.values()):.1f}%" for k, v in results.items()))
 

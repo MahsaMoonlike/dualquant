@@ -16,7 +16,7 @@ from full_model_nvfp4 import build_model
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=common.DEFAULT_MODEL)
-    ap.add_argument("--mode", choices=["bf16", "nvfp4"], required=True)
+    ap.add_argument("--mode", choices=["bf16", "nvfp4", "sq_nvfp4", "sqs_nvfp4", "awq_nvfp4"], required=True)
     ap.add_argument("--seqlen", type=int, default=8192)
     cli = ap.parse_args()
     import nvfp4_numerics as N
@@ -26,7 +26,7 @@ def main():
     ids = common.wikitext_test_ids(cli.model, cli.seqlen)
     print(f"{cli.mode}: test tokens={ids.numel()} windows={ids.numel()//cli.seqlen} seqlen={cli.seqlen}")
     val = common.ppl(model, ids, cli.seqlen, dev)
-    tag = f"real packed W4A4, act NVFP4[{N.MODE}]" if cli.mode == "nvfp4" else "BF16"
+    tag = f"real packed W4A4, act NVFP4[{N.MODE}]" if cli.mode != "bf16" else "BF16"
     print(f"\nRESULT {cli.mode} WikiText-2 PPL (seqlen={cli.seqlen}, {tag}): {val:.4f}")
 
 
